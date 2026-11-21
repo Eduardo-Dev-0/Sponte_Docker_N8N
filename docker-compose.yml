@@ -1,0 +1,144 @@
+name: sponte-stack
+
+services:
+  postgres:
+    image: postgres:17            # mesma major (ou maior) do seu Postgres antigo
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: sponte_dw
+      TZ: America/Sao_Paulo
+      PGTZ: America/Sao_Paulo
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5433:5432"     # acesso de fora (DBeaver, Power BI); entre containers continua 5432
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER} -d sponte_dw"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+
+  etl:
+    build: ./sponte_etl
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      TZ: America/Sao_Paulo
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DB: sponte_dw
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      INTERVAL_MINUTES: ${ETL_INTERVAL_MINUTES:-360}
+      ETL_STEPS: ${ETL_STEPS:-python carga_unificada.py}
+      FREQ_MODO: ${FREQ_MODO:-completa}
+      RETRY_MINUTES: ${ETL_RETRY_MINUTES:-10}
+      PG_CONNECT_RETRIES: ${PG_CONNECT_RETRIES:-40}
+      STEP_TIMEOUT_MIN: ${ETL_STEP_TIMEOUT_MIN:-180}
+    volumes:
+      - ./sponte_etl:/app
+
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: "5432"
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: ${PG_USER}
+      DB_POSTGRESDB_PASSWORD: ${PG_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      GENERIC_TIMEZONE: America/Sao_Paulo
+      TZ: America/Sao_Paulo
+      N8N_HOST: ${N8N_HOST:-localhost}
+      WEBHOOK_URL: ${N8N_WEBHOOK_URL:-http://localhost:5678/}
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8ndata:/home/node/.n8n
+
+  evolution:
+    image: evoapicloud/evolution-api:latest   # fixe a tag v2 atual quando estiver estável
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      SERVER_URL: ${EVOLUTION_SERVER_URL:-http://localhost:8080}
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY}
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: postgresql://${PG_USER}:${PG_PASSWORD}@postgres:5432/evolution
+      DATABASE_CONNECTION_CLIENT_NAME: evolution
+      DATABASE_SAVE_DATA_INSTANCE: "true"
+      DATABASE_SAVE_DATA_NEW_MESSAGE: "true"
+      DATABASE_SAVE_MESSAGE_UPDATE: "true"
+      DATABASE_SAVE_DATA_CONTACTS: "true"
+      DATABASE_SAVE_DATA_CHATS: "true"
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: redis://redis:6379/6
+      CACHE_REDIS_PREFIX_KEY: evolution
+      CACHE_REDIS_SAVE_INSTANCES: "false"
+      CACHE_LOCAL_ENABLED: "false"
+    ports:
+      - "8080:8080"
+    volumes:
+      - evolution_instances:/evolution/instances
+
+  backup:
+    image: postgres:17            # mesma major do serviço postgres
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: ${PG_USER}
+      PGPASSWORD: ${PG_PASSWORD}
+      TZ: America/Sao_Paulo
+      BACKUP_DIAS: ${BACKUP_DIAS:-14}
+    volumes:
+      - ./backups:/backups
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        until pg_isready -q; do sleep 2; done
+        while true; do
+          ts=$$(date +%Y%m%d_%H%M)
+          for db in sponte_dw n8n evolution; do
+            if pg_dump -Fc -d $${db} -f /backups/$${db}_$${ts}.tmp; then
+              mv /backups/$${db}_$${ts}.tmp /backups/$${db}_$${ts}.dump
+              echo "ok $${db}"
+            else
+              rm -f /backups/$${db}_$${ts}.tmp
+              echo "ERRO $${db}"
+            fi
+          done
+          find /backups -name '*.dump' -mtime +$${BACKUP_DIAS} -delete
+          sleep 86400
+        done
+
+volumes:
+  pgdata:
+  redisdata:
+  n8ndata:
+  evolution_instances:
